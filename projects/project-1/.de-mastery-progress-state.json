@@ -1,0 +1,189 @@
+{
+  "version": "1.0.0",
+  "projectId": "project-1",
+  "activeTaskId": "p1-t5",
+  "completedTasks": [
+    "p1-t1",
+    "p1-t2",
+    "p1-t3",
+    "p1-t4",
+    "p1-t5"
+  ],
+  "files": {
+    "pipeline.py": {
+      "filename": "pipeline.py",
+      "language": "python",
+      "content": "\"\"\"\nRetail POS Daily Ingestion & Aggregation Pipeline\n\"\"\"\nimport csv\nimport logging\nfrom pathlib import Path\nimport sqlite3\nfrom typing import List, Dict, Any, Tuple\n\nlogging.basicConfig(\n    level=logging.INFO,\n    format=\"%(asctime)s [%(levelname)s] %(message)s\"\n)\n\nlogger = logging.getLogger(__name__)\n\ndef ingest_csv(filepath: str) -> List[Dict[str, Any]]:\n    \"\"\"\n    Reads a raw CSV file and returns a list of dictionaries with basic type casting.\n    \"\"\"\n    path = Path(filepath)\n    # Handle file not found\n    if not path.exists():\n        logger.error(f\"File not found at {filepath}\")\n        raise FileNotFoundError(f\"File missing: {filepath}\")\n\n    # Handle empty file\n    if path.stat().st_size == 0:\n        logger.warning(f\"File is empty: {filepath}\")\n        return []\n\n    records = []\n    with open(path, mode=\"r\", encoding=\"utf-8\") as f:\n        reader = csv.DictReader(f)\n        for row_num, row in enumerate(reader, start=1):\n            try:\n                record = {\n                    \"txn_id\": str(row[\"txn_id\"]).strip(),\n                    \"store_id\": str(row[\"store_id\"]).strip(),\n                    \"txn_timestamp\": str(row[\"txn_timestamp\"]).strip(),\n                    \"product_sku\": str(row[\"product_sku\"]).strip(),\n                    \"quantity\": int(row[\"quantity\"]),\n                    \"unit_price\": float(row[\"unit_price\"]),\n                    \"discount_pct\": float(row[\"discount_pct\"])\n                }\n                records.append(record)\n            except (KeyError, ValueError) as e:\n                logger.warning(f\"Skipping malformed record {row_num}. Error: {e}\")\n\n    logger.info(f\"Successfully ingested {len(records)} records from {filepath}.\")\n    return records\n\ndef clean_transactions(records: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:\n    \"\"\"\n    Deduplicates records by txn_id and filters out invalid\n    quantities, prices, and discounts.\n\n    Returns:\n        (clean_records, quarantined_records)\n    \"\"\"\n    clean_records = []\n    quarantined = []\n    seen_ids = set()\n    for record in records:\n        record_id = record[\"txn_id\"]\n        # Deduplicate\n        if record_id in seen_ids:\n            logger.warning(f\"Duplicate transaction skipped: {record_id}\")\n            continue\n\n        seen_ids.add(record_id)\n        # Validate transaction values\n        if (record[\"quantity\"] > 0 and record[\"unit_price\"] > 0 and 0 <= record[\"discount_pct\"] <= 100):\n            # Calculate gross amount\n            record[\"gross_amount\"] = (record[\"quantity\"] * record[\"unit_price\"])\n            # Calculate net amount after discount\n            record[\"net_amount\"] = (record[\"gross_amount\"] * (1 - record[\"discount_pct\"] / 100.0))\n            clean_records.append(record)\n        else:\n            quarantined.append(record)\n\n    logger.info(f\"Clean records: {len(clean_records)}, \"f\"Quarantined records: {len(quarantined)}\")\n    return clean_records, quarantined\n\ndef init_db(db_path: str = \"retail_sales.db\",schema_file: str = \"schema.sql\"):\n    \"\"\"\n    Initializes the SQLite database using schema.sql.\n    \"\"\"\n    with open(schema_file, \"r\", encoding=\"utf-8\") as f:\n        ddl = f.read()\n    conn = sqlite3.connect(db_path)\n    try:\n        cursor = conn.cursor()\n        cursor.executescript(ddl)\n        conn.commit()\n    finally:\n        conn.close()\n    logger.info(\"Database schema successfully initialized.\")\n\ndef load_clean_transactions(db_conn: sqlite3.Connection,records: List[Dict[str, Any]]) -> int:\n    \"\"\"\n    Loads clean transactions into stg_pos_transactions idempotently.\n    Uses ON CONFLICT(txn_id) DO UPDATE so that rerunning the same\n    records does not create duplicates.\n    Returns:\n        Number of successfully upserted records.\n    \"\"\"\n\n    upsert_sql = \"\"\"\n        INSERT INTO stg_pos_transactions (\n            txn_id,\n            store_id,\n            txn_timestamp,\n            product_sku,\n            quantity,\n            unit_price,\n            discount_pct,\n            net_amount\n        )\n        VALUES (?, ?, ?, ?, ?, ?, ?, ?)\n        ON CONFLICT(txn_id) DO UPDATE SET\n            store_id = excluded.store_id,\n            txn_timestamp = excluded.txn_timestamp,\n            product_sku = excluded.product_sku,\n            quantity = excluded.quantity,\n            unit_price = excluded.unit_price,\n            discount_pct = excluded.discount_pct,\n            net_amount = excluded.net_amount,\n            ingested_at = CURRENT_TIMESTAMP\n    \"\"\"\n\n    loaded_count = 0\n    batch_size = 5\n    cursor = db_conn.cursor()\n    try:\n        for batch in batch_generator(records, batch_size):\n            cursor.executemany(upsert_sql, batch)\n            db_conn.commit()\n            loaded_count += len(batch)\n            logger.info(f\"Successfully upserted batch of {len(batch)} records.\")\n    except Exception as e:\n        db_conn.rollback()\n        logger.error(f\"Exception occurred while loading transactions: {e}\")\n        raise\n    finally:\n        cursor.close()\n    logger.info(f\"Total transactions upserted: {loaded_count}\")\n    return loaded_count\n\ndef batch_generator(records, batch_size=5):\n    \"\"\"\n    Generates records in batches.\n    \"\"\"\n    batch = []\n    for r in records:\n        batch.append(\n            (\n                r[\"txn_id\"],\n                r[\"store_id\"],\n                r[\"txn_timestamp\"],\n                r[\"product_sku\"],\n                r[\"quantity\"],\n                r[\"unit_price\"],\n                r[\"discount_pct\"],\n                r[\"net_amount\"]\n            )\n        )\n        if len(batch) == batch_size:\n            yield batch\n            batch = []\n    if batch:\n        yield batch\n\ndef generate_daily_mart(db_conn: sqlite3.Connection) -> int:\n    \"\"\"Aggregates staging transactions and updates the summary mart.\"\"\"\n    # We perform an idempotent upsert directly in one SQL statement\n    mart_sql = \"\"\"\n    INSERT OR REPLACE INTO daily_store_sales_summary (\n        report_date, store_id, total_transactions, total_items_sold, \n        gross_revenue, net_revenue, updated_at\n    )\n    SELECT \n        DATE(txn_timestamp) as report_date,\n        store_id,\n        COUNT(DISTINCT txn_id) as total_transactions,\n        SUM(quantity) as total_items_sold,\n        SUM(quantity * unit_price) as gross_revenue,\n        SUM(net_amount) as net_revenue,\n        CURRENT_TIMESTAMP\n    FROM stg_pos_transactions\n    GROUP BY 1, 2;\n    \"\"\"\n    cursor = db_conn.cursor()\n    try:\n        cursor.execute(mart_sql)\n        db_conn.commit()\n        count = cursor.rowcount\n        logger.info(f\"Daily mart updated successfully. Records affected: {count}\")\n        return count\n    except sqlite3.Error as e:\n        db_conn.rollback()\n        logger.error(f\"Data mart generation failed: {e}\")\n        raise  \n\nif __name__ == \"__main__\":\n    try:\n        # Initialize database\n        init_db()\n        # Create connection\n        conn = sqlite3.connect(\"retail_sales.db\")\n        try:\n            # Ingest\n            raw_data = ingest_csv(\"data/raw_pos_transactions.csv\")\n            # Clean\n            clean_data, quarantined_data = clean_transactions(raw_data)\n            # Load\n            loaded_count = load_clean_transactions(\n                conn,\n                clean_data\n            )\n            mart_loaded_count = generate_daily_mart(conn)\n            logger.info(f\"Pipeline completed successfully. Loaded: {loaded_count}, Quarantined: {len(quarantined_data)}\")\n        finally:\n            conn.close()\n    except Exception as e:\n        logger.error(f\"Pipeline failed: {e}\")"
+    },
+    "schema.sql": {
+      "filename": "schema.sql",
+      "language": "sql",
+      "content": "CREATE TABLE IF NOT EXISTS stg_pos_transactions (\n    txn_id VARCHAR(50) NOT NULL PRIMARY KEY,\n    store_id VARCHAR(20) NOT NULL,\n    txn_timestamp TIMESTAMP NOT NULL,\n    product_sku VARCHAR(50) NOT NULL,\n    quantity INTEGER NOT NULL,\n    unit_price NUMERIC(10,2) NOT NULL,\n    discount_pct NUMERIC(5,2) DEFAULT 0.0,\n    net_amount NUMERIC(10,2) NOT NULL,\n    ingested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP\n);\n\nCREATE TABLE IF NOT EXISTS daily_store_sales_summary (\n    report_date DATE NOT NULL,\n    store_id VARCHAR(20) NOT NULL,\n    total_transactions INTEGER NOT NULL,\n    total_items_sold INTEGER NOT NULL,\n    gross_revenue NUMERIC(12,2) NOT NULL,\n    net_revenue NUMERIC(12,2) NOT NULL,\n    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,\n    PRIMARY KEY (report_date, store_id)\n);\n\nCREATE INDEX IF NOT EXISTS idx_daily_store_sales_summary_store_id\nON daily_store_sales_summary (store_id);"
+    },
+    "README.md": {
+      "filename": "README.md",
+      "language": "markdown",
+      "content": "# Retail Daily Sales Aggregation Pipeline\n\n## Overview\nA production-grade batch data pipeline for ingesting, validating, and aggregating retail POS transactions.\n\n## Architecture\n- Source: POS CSV exports\n- Ingestion: Python Ingestion Engine\n- Target: Analytical Relational Mart\n"
+    }
+  },
+  "gitHistory": [
+    {
+      "hash": "2c87b16",
+      "message": "feat(mart): add daily store sales aggregation and complete project 1 release",
+      "timestamp": "2026-09-12T15:26:36.475Z",
+      "author": "Learner (Data Engineer)",
+      "branch": "feature/data-pipeline",
+      "filesChanged": [
+        "pipeline.py",
+        "schema.sql",
+        "README.md"
+      ]
+    },
+    {
+      "hash": "28392c3",
+      "message": "feat(mart): add daily store sales aggregation and complete project 1 release",
+      "timestamp": "2026-09-12T15:17:36.806Z",
+      "author": "Learner (Data Engineer)",
+      "branch": "feature/data-pipeline",
+      "filesChanged": [
+        "pipeline.py",
+        "schema.sql",
+        "README.md"
+      ]
+    },
+    {
+      "hash": "d464ff6",
+      "message": "feat(mart): add daily store sales aggregation and complete project 1 release",
+      "timestamp": "2026-09-12T15:17:01.646Z",
+      "author": "Learner (Data Engineer)",
+      "branch": "feature/data-pipeline",
+      "filesChanged": [
+        "pipeline.py",
+        "schema.sql",
+        "README.md"
+      ]
+    },
+    {
+      "hash": "9f10d69",
+      "message": "feat(loader): implement idempotent upsert for pos staging data",
+      "timestamp": "2026-09-12T15:11:27.188Z",
+      "author": "Learner (Data Engineer)",
+      "branch": "feature/data-pipeline",
+      "filesChanged": [
+        "pipeline.py",
+        "schema.sql",
+        "README.md"
+      ]
+    },
+    {
+      "hash": "9995865",
+      "message": "feat(loader): implement idempotent upsert for pos staging data",
+      "timestamp": "2026-09-11T03:54:41.336Z",
+      "author": "Learner (Data Engineer)",
+      "branch": "feature/data-pipeline",
+      "filesChanged": [
+        "pipeline.py",
+        "schema.sql",
+        "README.md"
+      ]
+    },
+    {
+      "hash": "5110399",
+      "message": "feat(db): define relational DDL schemas with composite keys and indexes",
+      "timestamp": "2026-09-11T03:54:33.059Z",
+      "author": "Learner (Data Engineer)",
+      "branch": "feature/data-pipeline",
+      "filesChanged": [
+        "pipeline.py",
+        "schema.sql",
+        "README.md"
+      ]
+    },
+    {
+      "hash": "ec51511",
+      "message": "feat(clean): implement deduplication and business rule validation",
+      "timestamp": "2026-09-07T17:34:50.294Z",
+      "author": "Learner (Data Engineer)",
+      "branch": "feature/data-pipeline",
+      "filesChanged": [
+        "pipeline.py",
+        "schema.sql",
+        "README.md"
+      ]
+    },
+    {
+      "hash": "a26e256",
+      "message": "feat(ingest): implement robust csv ingestion with strict type casting",
+      "timestamp": "2026-09-07T16:39:07.349Z",
+      "author": "Learner (Data Engineer)",
+      "branch": "feature/data-pipeline",
+      "filesChanged": [
+        "pipeline.py",
+        "schema.sql",
+        "README.md"
+      ]
+    },
+    {
+      "hash": "99bf8b2",
+      "message": "feat(ingest): implement robust csv ingestion with strict type casting",
+      "timestamp": "2026-09-07T16:37:15.959Z",
+      "author": "Learner (Data Engineer)",
+      "branch": "feature/data-pipeline",
+      "filesChanged": [
+        "pipeline.py",
+        "schema.sql",
+        "README.md"
+      ]
+    },
+    {
+      "hash": "4cb1e2c",
+      "message": "feat(ingest): implement robust csv ingestion with strict type casting",
+      "timestamp": "2026-08-28T17:48:08.086Z",
+      "author": "Learner (Data Engineer)",
+      "branch": "feature/data-pipeline",
+      "filesChanged": [
+        "pipeline.py",
+        "schema.sql",
+        "README.md"
+      ]
+    },
+    {
+      "hash": "fd163db",
+      "message": "feat(ingest): implement robust csv ingestion with strict type casting",
+      "timestamp": "2026-08-28T17:48:01.122Z",
+      "author": "Learner (Data Engineer)",
+      "branch": "feature/data-pipeline",
+      "filesChanged": [
+        "pipeline.py",
+        "schema.sql",
+        "README.md"
+      ]
+    },
+    {
+      "hash": "a0a16c6",
+      "message": "Initial Commit",
+      "timestamp": "2026-08-28T17:33:26.469Z",
+      "author": "Learner (Data Engineer)",
+      "branch": "feature/data-pipeline",
+      "filesChanged": [
+        "pipeline.py",
+        "schema.sql",
+        "README.md"
+      ]
+    },
+    {
+      "hash": "3793f52",
+      "message": "feat(ingest): implement robust csv ingestion with strict type casting",
+      "timestamp": "2026-08-28T17:32:18.430Z",
+      "author": "Learner (Data Engineer)",
+      "branch": "feature/data-pipeline",
+      "filesChanged": [
+        "pipeline.py",
+        "schema.sql",
+        "README.md"
+      ]
+    }
+  ],
+  "savedAt": "2026-09-12T16:21:29.836Z",
+  "clientInfo": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
+}
